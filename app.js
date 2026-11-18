@@ -1,7 +1,7 @@
 /* rzAI Mobil — tamamen cihazda calisan yapay zeka (WebLLM + WebGPU) */
 import * as webllm from "./vendor/web-llm.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const PREVIEW = new URLSearchParams(location.search).has("onizleme"); // WebGPU olmadan arayuz onizlemesi
@@ -100,7 +100,7 @@ function openChat(id) {
   if (state.busy) return;
   const c = state.chats.find(x => x.id === id); if (!c) return;
   state.chatId = id; msgs.innerHTML = "";
-  for (const m of c.messages) m.role === "user" ? addUser(m.content) : addAssistant(m.content);
+  for (const m of c.messages) m.role === "user" ? addUser(m.content) : (m.image ? addImageMsg(m.image, m.prompt, m.ms) : addAssistant(m.content));
   setHasMsgs(); closeSide(); renderChatList(); toBottom(true);
 }
 function newChat() {
@@ -111,7 +111,8 @@ function historyFor(chat) {
   // baglam penceresi 4096 token: son mesajlari ~6000 karaktere sigdir
   const out = []; let total = 0;
   for (let i = chat.messages.length - 1; i >= 0; i--) {
-    const m = chat.messages[i]; total += m.content.length;
+    const m = chat.messages[i].image ? {role: "assistant", content: `[Görsel oluşturuldu: ${chat.messages[i].prompt || ""}]`} : chat.messages[i];
+    total += m.content.length;
     if (total > 6000 && out.length) break;
     out.unshift({role: m.role, content: m.content.slice(-6000)});
   }
@@ -121,6 +122,8 @@ function historyFor(chat) {
 /* ---------------- gonder ---------------- */
 async function send() {
   const text = input.value.trim(); if (!text || state.busy) return;
+  if (img.mode) return sendImage(text);
+  if (state.engine && !state.loadedId && !PREVIEW) await loadModel(state.settings.model);
   if (!state.engine) { errorBox(PREVIEW ? "Önizleme modu: model yüklü değil." : "Model henüz yüklenmedi."); return; }
   input.value = ""; autoGrow();
   let chat = state.chats.find(x => x.id === state.chatId);
@@ -166,8 +169,10 @@ input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(pointer:fine)").matches) { e.preventDefault(); send(); }
 });
 $("#composer").addEventListener("submit", e => { e.preventDefault(); state.busy ? stop() : send(); });
-document.querySelectorAll(".card").forEach(c => c.onclick = () => { input.value = c.dataset.prompt; autoGrow(); input.focus();
-  input.setSelectionRange(input.value.length, input.value.length); });
+document.querySelectorAll(".card").forEach(c => c.onclick = async () => {
+  if (c.dataset.img) { const ok = await enterImageMode(); if (!ok) return; input.value = c.dataset.img; }
+  else { if (img.mode) exitImageMode(); input.value = c.dataset.prompt; }
+  autoGrow(); input.focus(); input.setSelectionRange(input.value.length, input.value.length); });
 
 /* ---------------- yan menu ---------------- */
 function closeSide() { document.body.classList.remove("side-open"); }
@@ -308,6 +313,142 @@ $("#delModel").onclick = async () => {
 };
 $("#delChats").onclick = () => { if (!confirm("Tüm sohbetler silinsin mi?")) return; state.chats = []; saveChats(); newChat(); };
 
+
+/* ---------------- gorsel olusturma (SDXS + ONNX Runtime Web / WebGPU) ---------------- */
+const IS_MOBILE = /iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent));
+const IMG_EP = new URLSearchParams(location.search).get("imgep") || "webgpu"; // test icin: ?imgep=wasm
+const img = {worker: null, ready: false, mode: false, waiters: [], onProgress: null};
+function imgWorker() {
+  if (img.worker) return img.worker;
+  img.worker = new Worker(new URL("./img/worker.js", import.meta.url), {type: "module"});
+  img.worker.onmessage = ({data}) => {
+    if (data.type === "progress") { img.onProgress?.(data); return; }
+    if (data.type === "note") { img.note = data.message; return; }
+    const w = img.waiters.shift(); if (!w) return;
+    data.type === "error" ? w.reject(new Error(data.message)) : w.resolve(data);
+  };
+  img.worker.onerror = e => { const w = img.waiters.shift(); w?.reject(new Error(e.message || "Görsel işçisi çöktü")); img.worker = null; img.ready = false; };
+  return img.worker;
+}
+const imgCall = msg => new Promise((resolve, reject) => { img.waiters.push({resolve, reject}); imgWorker().postMessage(msg); });
+const memErr = m => /memory|alloc|OOM|out of|device.*lost|buffer|RangeError|Aborted/i.test(m);
+const trErr = m => memErr(m) ? "Telefonun belleği görsel modeli için yetmedi. Diğer uygulamaları kapat, uygulamayı yeniden aç ve tekrar dene. (Bu iş için iPhone 15 Pro veya daha yenisi önerilir.)" : m;
+
+function setImgProg(p) {
+  const fill = $("#imgBarFill"), pct = $("#imgPct"), t = $("#imgProgText");
+  if (p.phase === "download") {
+    const r = p.loaded / p.total; fill.style.width = (r * 100).toFixed(1) + "%"; pct.textContent = "%" + Math.floor(r * 100);
+    t.textContent = `İndiriliyor: ${(p.loaded / 1048576).toFixed(0)} / ${(p.total / 1048576).toFixed(0)} MB`;
+  } else if (p.phase === "init") { t.textContent = "Ekran kartına yükleniyor…"; }
+}
+async function enterImageMode() {
+  if (img.ready) { setImgMode(true); return true; }
+  if (PREVIEW) { img.ready = true; setImgMode(true); return true; }
+  if (!("gpu" in navigator) && IMG_EP === "webgpu") { errorBox("Görsel oluşturma için WebGPU gerekli (iOS 26+)."); return false; }
+  let cached = false;
+  try { cached = (await imgCall({type: "status"})).cached; } catch {}
+  $("#imgSetup").classList.remove("hidden"); $("#imgErr").textContent = "";
+  $("#imgStart").disabled = false; $("#imgProgWrap").classList.add("hidden");
+  $("#imgStart").textContent = cached ? "Başla" : "İndir ve başla";
+  return await new Promise(resolve => {
+    const close = ok => { $("#imgSetup").classList.add("hidden"); resolve(ok); };
+    $("#imgCancel").onclick = $("#imgSetupClose").onclick = () => close(false);
+    $("#imgStart").onclick = async () => {
+      if (!cached && !navigator.onLine) { $("#imgErr").textContent = "İlk indirme için internet gerekli."; return; }
+      $("#imgStart").disabled = true; $("#imgProgWrap").classList.remove("hidden");
+      img.onProgress = setImgProg;
+      try { await navigator.storage?.persist?.(); } catch {}
+      try {
+        await imgCall({type: "load", opts: {ep: IMG_EP, lowMem: IS_MOBILE}});
+        img.ready = true; setImgMode(true); close(true);
+      } catch (e) { $("#imgErr").textContent = "Yüklenemedi: " + trErr(String(e.message || e)); $("#imgStart").disabled = false; }
+    };
+    if (cached) $("#imgStart").click();
+  });
+}
+function setImgMode(on) {
+  img.mode = on; document.body.classList.toggle("img-mode", on); $("#imgBar").classList.toggle("hidden", !on);
+  input.placeholder = on ? "Görsel tarifini yaz…" : "rzAI'ye bir şey yaz...";
+}
+function exitImageMode() { setImgMode(false); }
+$("#imgModeBtn").onclick = () => img.mode ? exitImageMode() : enterImageMode();
+$("#imgBarClose").onclick = exitImageMode;
+
+function addImageMsg(src, prompt, ms) {
+  const d = document.createElement("div"); d.className = "msg assistant";
+  d.innerHTML = `<div class="logo logo-xs"><span>rz</span><i></i></div><div class="body"><div class="gen-img"><img alt="Oluşturulan görsel"><div class="gen-acts">
+    <a class="btn" download="rzai-gorsel.jpg">⬇ Kaydet</a><span></span></div></div></div>`;
+  d.querySelector("img").src = src; d.querySelector("a").href = src;
+  d.querySelector(".gen-acts span").textContent = (prompt ? "“" + prompt + "”" : "") + (ms ? ` · ${(ms / 1000).toFixed(1)} sn` : "");
+  d.querySelector("a").onclick = async e => { // iOS: Paylas menusunden "Resmi Kaydet"
+    if (navigator.canShare) { try { const b = await (await fetch(src)).blob(); const f = new File([b], "rzai-gorsel.jpg", {type: "image/jpeg"});
+      if (navigator.canShare({files: [f]})) { e.preventDefault(); await navigator.share({files: [f]}); } } catch {} } };
+  d.querySelector("img").onload = () => toBottom();
+  msgs.append(d); setHasMsgs(); toBottom(true); return d;
+}
+async function translateForImage(text) {
+  if (!/[çğıöşüÇĞİÖŞÜ]|\b(ve|bir|ile|gibi|olan|için)\b/i.test(text)) return text; // zaten Ingilizce gibi
+  if (!state.engine || !state.loadedId || PREVIEW) return text;
+  try {
+    const r = await state.engine.chat.completions.create({temperature: 0.2, max_tokens: 90, messages: [
+      {role: "system", content: "Translate the user's Turkish image description into ONE short English image-generation prompt (subject, details, style, lighting). Output ONLY the English prompt."},
+      {role: "user", content: text}]});
+    const out = (r.choices?.[0]?.message?.content || "").split("\n").find(l => l.trim()) || text;
+    return out.replace(/^["'\s]+|["'\s]+$/g, "").slice(0, 300);
+  } catch { return text; }
+}
+async function sendImage(text) {
+  input.value = ""; autoGrow();
+  let chat = state.chats.find(x => x.id === state.chatId);
+  if (!chat) { chat = {id: Date.now().toString(36), title: "🎨 " + text.slice(0, 36), updated: Date.now(), messages: []}; state.chats.push(chat); state.chatId = chat.id; }
+  chat.messages.push({role: "user", content: "🎨 " + text}); saveChats(); renderChatList();
+  addUser("🎨 " + text);
+  const d = document.createElement("div"); d.className = "msg assistant";
+  d.innerHTML = `<div class="logo logo-xs"><span>rz</span><i></i></div><div class="body"><div class="img-progress">
+    <div class="ph" data-p="tr">○ Tarif İngilizceye çevriliyor</div><div class="ph" data-p="text">○ Metin anlaşılıyor</div>
+    <div class="ph" data-p="unet">○ Görsel çiziliyor</div><div class="ph" data-p="vae">○ Görüntü oluşturuluyor</div><div class="skel"></div></div></div>`;
+  msgs.append(d); toBottom(true);
+  const order = ["tr", "text", "unet", "vae"];
+  const mark = ph => order.forEach((k, i) => { const el = d.querySelector(`[data-p="${k}"]`); const cur = order.indexOf(ph);
+    el.className = "ph" + (i < cur ? " ok" : i === cur ? " on" : ""); el.textContent = (i < cur ? "✓ " : i === cur ? "◌ " : "○ ") + el.textContent.slice(2); });
+  setBusy(true);
+  try {
+    mark("tr");
+    const en = await translateForImage(text);
+    let res;
+    if (PREVIEW) { for (const ph of ["text", "unet", "vae"]) { mark(ph); await new Promise(r => setTimeout(r, 400)); } res = demoImage(en); }
+    else {
+      if (IS_MOBILE && state.engine && state.loadedId) { try { await state.engine.unload(); } catch {} state.loadedId = null; setStatus("warn", "Sohbet modeli beklemede"); }
+      img.onProgress = p => p.phase && mark(p.phase);
+      localStorage.setItem("rzm_img_running", "1");
+      res = await imgCall({type: "generate", prompt: en, seed: Math.floor(Math.random() * 2 ** 31)});
+      localStorage.removeItem("rzm_img_running");
+    }
+    const cv = document.createElement("canvas"); cv.width = res.width; cv.height = res.height;
+    cv.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(res.pixels), res.width, res.height), 0, 0);
+    const url = cv.toDataURL("image/jpeg", 0.88);
+    d.remove(); addImageMsg(url, en, res.ms);
+    chat.messages.push({role: "assistant", content: "", image: url, prompt: en, ms: Math.round(res.ms)}); chat.updated = Date.now(); saveChats();
+  } catch (e) {
+    localStorage.removeItem("rzm_img_running");
+    d.remove(); errorBox("Görsel oluşturulamadı: " + trErr(String(e.message || e)));
+  } finally { setBusy(false); }
+}
+function demoImage(prompt) { // ?onizleme icin sahte gorsel
+  const c = document.createElement("canvas"); c.width = c.height = 512; const g = c.getContext("2d");
+  const gr = g.createLinearGradient(0, 0, 512, 512); gr.addColorStop(0, "#0b1d3a"); gr.addColorStop(.55, "#5b2a86"); gr.addColorStop(1, "#ff9a3c");
+  g.fillStyle = gr; g.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 140; i++) { g.fillStyle = `rgba(255,255,255,${Math.random()})`; g.fillRect(Math.random() * 512, Math.random() * 300, 2, 2); }
+  g.fillStyle = "#22e06b"; g.beginPath(); g.arc(380, 140, 60, 0, 7); g.fill();
+  g.fillStyle = "rgba(0,0,0,.45)"; g.fillRect(0, 430, 512, 82); g.fillStyle = "#fff"; g.font = "bold 22px sans-serif";
+  g.fillText("ÖNİZLEME (sahte görsel)", 20, 465); g.font = "15px sans-serif"; g.fillText(prompt.slice(0, 52), 20, 492);
+  return {pixels: g.getImageData(0, 0, 512, 512).data, width: 512, height: 512, ms: 1200};
+}
+$("#delImgModel").onclick = async () => {
+  if (!confirm("Görsel modeli (~880 MB) telefondan silinsin mi?")) return;
+  try { await imgCall({type: "delete"}); } catch {} img.ready = false; exitImageMode(); openSettings();
+};
+
 /* ---------------- onizleme: sahte model (sadece ?onizleme) ---------------- */
 function demoEngine() {
   const reply = "Önizleme modundasın, gerçek model yüklü değil. Örnek cevap:\n\n```python\nimport random\nsayi = random.randint(1, 100)\nwhile (t := int(input('Tahmin: '))) != sayi:\n    print('Daha büyük' if t < sayi else 'Daha küçük')\nprint('Bildin!')\n```\n\n**Kopyala** düğmesiyle kodu alabilirsin.";
@@ -327,6 +468,10 @@ async function gpuCheck() {
 }
 async function boot() {
   applyName(); renderChatList(); updateNet();
+  if (localStorage.getItem("rzm_img_running")) {
+    localStorage.removeItem("rzm_img_running");
+    setTimeout(() => errorBox("Son görsel denemesinde uygulama kapandı: telefonun belleği yetmemiş olabilir. Diğer uygulamaları kapatıp tekrar dene veya sadece sohbet modunu kullan."), 500);
+  }
   if (PREVIEW) { state.engine = demoEngine(); setStatus("warn", "Önizleme modu (sahte model)"); return; }
   const g = await gpuCheck();
   if (!g.ok) { $("#nogpu").classList.remove("hidden"); $("#nogpuDetail").textContent = g.why; setStatus("bad", "WebGPU yok"); return; }

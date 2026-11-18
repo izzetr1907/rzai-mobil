@@ -61,6 +61,17 @@ Bu klasör hazır bir statik sitedir; derleme gerekmez. Üç seçenek var, **en 
 - Sağ üstte **✈︎ internetsiz** yazısını görürsün.
 - Model değiştirmek / silmek / yer açmak için: sol menü → **Ayarlar & modeller**.
 
+## 5) Görsel oluşturma 🎨 (yeni)
+- Ana ekrandaki **🎨 Görsel oluştur** kartına veya yazı kutusunun solundaki **resim düğmesine** dokun → Görsel modu açılır.
+- İlk seferde görsel modeli (**SDXS-512 DreamShaper, ~880 MB**) bir kere indirilir; sonra **internetsiz** çalışır.
+- Tarifini Türkçe yaz (ör. "karlı dağda ahşap kulübe"). rzAI önce sohbet modeliyle İngilizceye çevirir, sonra 512×512 görseli **telefonunda** çizer.
+- Görselin altındaki **⬇ Kaydet** ile Fotoğraflar'a kaydedebilir/paylaşabilirsin.
+- **Dürüst uyarı:** Ağır bir iş. **iPhone 15 Pro / 16 / 17 (8 GB RAM)** önerilir. Eski iPhone'larda bellek yetmeyip uygulama kapanabilir; o zaman diğer uygulamaları kapatıp tekrar dene. Bir görsel birkaç saniye – 1 dakika sürebilir. Çizim sırasında sohbet modeli bellekten geçici olarak çıkarılır, sonraki mesajında kendiliğinden geri yüklenir.
+- GPU yarım hassasiyet (fp16) desteklemiyorsa işlemciyle çizer (çok daha yavaş).
+- Gizli Sekme'de model kaydedilemez; normal Safari / Ana Ekran uygulamasını kullan.
+- Yer açmak için: Ayarlar → **Görsel modelini sil**.
+- Kalite: tek adımda çizen küçük bir model; Midjourney kalitesi bekleme. Yazı/harf çizmekte zayıftır. Model lisansı (CreativeML OpenRAIL++-M) zararlı/yasa dışı içerik üretmeyi yasaklar.
+
 ## Sorun giderme
 | Sorun | Çözüm |
 |---|---|
