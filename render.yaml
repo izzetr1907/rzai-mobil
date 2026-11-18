@@ -1,0 +1,21 @@
+# Render Blueprint: rzAI Mobil statik site (ucretsiz). Repo kokunde bu dosya olmali.
+services:
+  - type: web
+    runtime: static
+    name: rzai-mobil
+    buildCommand: echo "build gerekmez"
+    staticPublishPath: .
+    pullRequestPreviewsEnabled: false
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /sw.js
+        name: Cache-Control
+        value: no-cache
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+      - path: /manifest.webmanifest
+        name: Content-Type
+        value: application/manifest+json
